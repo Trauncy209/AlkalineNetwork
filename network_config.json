@@ -1,0 +1,15 @@
+{
+  "mesh_id": "AlkalineNet",
+  "mesh_passphrase": "56556954c030def6e2eb8f79cb050bfc",
+  "admin_password": "sX3AIlN4X14LIka785FjlQ",
+  "customer_wifi_password": "aQfxheF2Kr8",
+  "gateway_count": 0,
+  "pinger_count": 0,
+  "devices": [],
+  "country_code": "US",
+  "halow_bandwidth": "4",
+  "halow_channel": "1",
+  "server_ip": "",
+  "server_port": 51820,
+  "server_pubkey": ""
+}
