@@ -70,12 +70,31 @@ class Database:
     
     def __init__(self, path: str = None):
         self.path = path or str(DB_PATH)
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self._conn = None
+        if self.path != ':memory:':
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+        else:
+            # For in-memory DB, keep a persistent connection
+            self._conn = sqlite3.connect(':memory:')
+            self._conn.row_factory = sqlite3.Row
         self._init_db()
+    
+    def _get_conn(self):
+        """Get database connection."""
+        if self._conn:
+            return self._conn
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    
+    def _close_conn(self, conn):
+        """Close connection if not persistent."""
+        if conn != self._conn:
+            conn.close()
     
     def _init_db(self):
         """Initialize database tables."""
-        conn = sqlite3.connect(self.path)
+        conn = self._get_conn()
         c = conn.cursor()
         
         # Gateways table
@@ -148,17 +167,16 @@ class Database:
         ''')
         
         conn.commit()
-        conn.close()
+        self._close_conn(conn)
     
     def execute(self, query: str, params: tuple = ()) -> list:
         """Execute a query and return results."""
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
+        conn = self._get_conn()
         c = conn.cursor()
         c.execute(query, params)
         results = c.fetchall()
         conn.commit()
-        conn.close()
+        self._close_conn(conn)
         return [dict(row) for row in results]
     
     def execute_one(self, query: str, params: tuple = ()) -> Optional[dict]:
