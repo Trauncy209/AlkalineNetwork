@@ -1,0 +1,32 @@
+{
+    "mode": "auto",
+    "device_id": "",
+    "mesh_id": "AlkalineNetwork",
+    
+    "server_ip": "YOUR_SERVER_IP_HERE",
+    "server_port": 51820,
+    "server_pubkey": "YOUR_SERVER_PUBLIC_KEY_HERE",
+    
+    "max_customers": 9,
+    "auto_connect": true,
+    
+    "wifi": {
+        "ssid": "AlkalineNet",
+        "password": "GENERATED_PASSWORD_HERE",
+        "channel": 1
+    },
+    
+    "mesh": {
+        "mesh_id": "AlkalineMesh",
+        "passphrase": "GENERATED_MESH_KEY_HERE",
+        "channel": 1,
+        "bandwidth": 4
+    },
+    
+    "admin": {
+        "password": "GENERATED_ADMIN_PASSWORD_HERE"
+    },
+    
+    "created_at": "",
+    "version": "1.0"
+}

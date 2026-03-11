@@ -134,6 +134,10 @@ class NetworkConfig:
             "country_code": COUNTRY_CODE,
             "halow_bandwidth": HALOW_BANDWIDTH,
             "halow_channel": HALOW_CHANNEL,
+            # Server settings (for encrypted tunnel)
+            "server_ip": "",
+            "server_port": 51820,
+            "server_pubkey": "",
         }
     
     def save(self):
@@ -614,6 +618,9 @@ class HeltecWebProvisioner:
                 stdin, stdout, stderr = client.exec_command(cmd, timeout=10)
                 stdout.read()  # Wait for completion
             
+            # Deploy Alkaline software
+            self._deploy_alkaline_software(client, mode, device_id)
+            
             client.close()
             self.log("✓ SSH configuration complete!")
             return True
@@ -621,6 +628,85 @@ class HeltecWebProvisioner:
         except Exception as e:
             self.log(f"  SSH failed: {e}")
             return False
+    
+    def _deploy_alkaline_software(self, client, mode: str, device_id: str):
+        """Deploy Alkaline Python software to the device."""
+        self.log("\nDeploying Alkaline software...")
+        
+        try:
+            # Create directories
+            commands = [
+                'mkdir -p /opt/alkaline',
+                'mkdir -p /etc/alkaline',
+                'mkdir -p /var/lib/alkaline',
+                'mkdir -p /var/log/alkaline',
+            ]
+            for cmd in commands:
+                stdin, stdout, stderr = client.exec_command(cmd, timeout=5)
+                stdout.read()
+            
+            # Get SFTP client
+            sftp = client.open_sftp()
+            
+            # Find our Python files
+            script_dir = Path(__file__).parent
+            files_to_upload = [
+                ('alkaline_complete.py', '/opt/alkaline/alkaline_complete.py'),
+                ('alkaline_mesh.py', '/opt/alkaline/alkaline_mesh.py'),
+                ('scripts/alkaline_boot.sh', '/opt/alkaline/alkaline_boot.sh'),
+            ]
+            
+            for local_name, remote_path in files_to_upload:
+                local_path = script_dir / local_name
+                if local_path.exists():
+                    self.log(f"  Uploading {local_name}...")
+                    sftp.put(str(local_path), remote_path)
+                else:
+                    self.log(f"  Warning: {local_name} not found")
+            
+            # Create config file
+            config_content = json.dumps({
+                "mode": mode,
+                "device_id": device_id,
+                "mesh_id": self.network_config.config["mesh_id"],
+                "server_ip": self.network_config.config.get("server_ip", ""),
+                "server_port": self.network_config.config.get("server_port", 51820),
+                "server_pubkey": self.network_config.config.get("server_pubkey", ""),
+                "max_customers": 9,
+                "auto_connect": True,
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "version": "1.0"
+            }, indent=2)
+            
+            # Write config via command (sftp might not have write permission to /etc)
+            config_b64 = base64.b64encode(config_content.encode()).decode()
+            stdin, stdout, stderr = client.exec_command(
+                f'echo "{config_b64}" | base64 -d > /etc/alkaline/config.json',
+                timeout=5
+            )
+            stdout.read()
+            self.log("  Created /etc/alkaline/config.json")
+            
+            # Make boot script executable and enable
+            commands = [
+                'chmod +x /opt/alkaline/alkaline_boot.sh',
+                'chmod +x /opt/alkaline/alkaline_mesh.py',
+                'chmod +x /opt/alkaline/alkaline_complete.py',
+                'ln -sf /opt/alkaline/alkaline_boot.sh /etc/init.d/alkaline 2>/dev/null || true',
+                '/opt/alkaline/alkaline_boot.sh enable 2>/dev/null || true',
+            ]
+            for cmd in commands:
+                stdin, stdout, stderr = client.exec_command(cmd, timeout=5)
+                stdout.read()
+            
+            sftp.close()
+            self.log("✓ Alkaline software deployed!")
+            self.log("  Software will auto-start on boot")
+            
+        except Exception as e:
+            self.log(f"  Software deployment failed: {e}")
+            self.log("  Device configured but software not deployed")
+            self.log("  You may need to manually copy files to /opt/alkaline/")
     
     def reboot(self):
         """Reboot the device."""
@@ -695,6 +781,56 @@ class FlashToolGUI:
             justify='left'
         )
         instructions.pack(pady=10)
+        
+        # Server settings frame
+        server_frame = tk.Frame(self.root, bg='#1a1a2e')
+        server_frame.pack(pady=5, fill='x', padx=40)
+        
+        tk.Label(
+            server_frame,
+            text="Server IP:",
+            font=('Helvetica', 10),
+            fg='#aaaaaa',
+            bg='#1a1a2e'
+        ).grid(row=0, column=0, sticky='e', padx=5, pady=2)
+        
+        self.server_ip_entry = tk.Entry(
+            server_frame,
+            font=('Courier', 11),
+            bg='#2a2a4e',
+            fg='#ffffff',
+            insertbackground='#00ff88',
+            width=20
+        )
+        self.server_ip_entry.insert(0, self.config.config.get("server_ip", ""))
+        self.server_ip_entry.grid(row=0, column=1, padx=5, pady=2)
+        
+        tk.Label(
+            server_frame,
+            text="Server Public Key:",
+            font=('Helvetica', 10),
+            fg='#aaaaaa',
+            bg='#1a1a2e'
+        ).grid(row=1, column=0, sticky='e', padx=5, pady=2)
+        
+        self.server_pubkey_entry = tk.Entry(
+            server_frame,
+            font=('Courier', 9),
+            bg='#2a2a4e',
+            fg='#ffffff',
+            insertbackground='#00ff88',
+            width=50
+        )
+        self.server_pubkey_entry.insert(0, self.config.config.get("server_pubkey", ""))
+        self.server_pubkey_entry.grid(row=1, column=1, padx=5, pady=2)
+        
+        tk.Label(
+            server_frame,
+            text="(Get these by running: python alkaline_complete.py --server)",
+            font=('Helvetica', 8),
+            fg='#666666',
+            bg='#1a1a2e'
+        ).grid(row=2, column=0, columnspan=2, pady=2)
         
         # Password frame
         pass_frame = tk.Frame(self.root, bg='#1a1a2e')
@@ -876,6 +1012,29 @@ class FlashToolGUI:
     def _do_flash(self, mode: str):
         """Execute flash operation."""
         password = self.password_entry.get()
+        
+        # Save server settings from GUI
+        self.config.config["server_ip"] = self.server_ip_entry.get().strip()
+        self.config.config["server_pubkey"] = self.server_pubkey_entry.get().strip()
+        self.config.save()
+        
+        # Validate server settings
+        if not self.config.config["server_ip"]:
+            messagebox.showwarning(
+                "Server IP Required",
+                "Enter your Alkaline server IP address.\n\n"
+                "This is where the encrypted tunnel connects to.\n\n"
+                "Run 'python alkaline_complete.py --server' on your server first."
+            )
+            return
+        
+        if not self.config.config["server_pubkey"]:
+            messagebox.showwarning(
+                "Server Public Key Required", 
+                "Enter the server's public key.\n\n"
+                "The server prints this when you start it with --server."
+            )
+            return
         
         self.set_buttons_state('disabled')
         mode_name = "Gateway (Mesh Gate)" if mode == "gateway" else "Pinger (Mesh Point)"
