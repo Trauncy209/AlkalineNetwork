@@ -329,6 +329,191 @@ class Database:
             WHERE entity_type = ? AND entity_id = ? AND hour >= ?
             ORDER BY hour ASC
         ''', (entity_type, entity_id, cutoff))
+    
+    def move_customer(self, customer_id: str, new_gateway_id: str) -> bool:
+        """Move a customer to a different gateway."""
+        try:
+            self.execute(
+                'UPDATE customers SET gateway_id = ?, last_seen = ? WHERE customer_id = ?',
+                (new_gateway_id, time.time(), customer_id)
+            )
+            logger.info(f"Moved customer {customer_id} to gateway {new_gateway_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to move customer: {e}")
+            return False
+    
+    def update_gateway_limit(self, gateway_id: str, max_customers: int) -> bool:
+        """Update gateway customer limit. Auto-moves overflow customers."""
+        try:
+            current_count = self.get_gateway_customer_count(gateway_id)
+            
+            # If new limit is lower than current customers, move overflow
+            if max_customers < current_count:
+                overflow = current_count - max_customers
+                logger.info(f"Gateway {gateway_id} limit {max_customers} < {current_count} customers, moving {overflow}")
+                
+                # Get customers to move (most recent first)
+                customers = self.execute(
+                    '''SELECT customer_id FROM customers 
+                       WHERE gateway_id = ? AND status = ? 
+                       ORDER BY created_at DESC LIMIT ?''',
+                    (gateway_id, 'active', overflow)
+                )
+                
+                for c in customers:
+                    new_gw = self.get_best_gateway_for_new_customer(exclude=gateway_id)
+                    if new_gw:
+                        self.move_customer(c['customer_id'], new_gw)
+                        logger.info(f"Auto-moved {c['customer_id']} to {new_gw}")
+                    else:
+                        logger.warning(f"No available gateway for {c['customer_id']}")
+            
+            self.execute(
+                'UPDATE gateways SET max_customers = ? WHERE gateway_id = ?',
+                (max_customers, gateway_id)
+            )
+            logger.info(f"Updated gateway {gateway_id} limit to {max_customers}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update limit: {e}")
+            return False
+    
+    def handle_gateway_offline(self, gateway_id: str) -> dict:
+        """Handle gateway going offline - reassign all customers."""
+        customers = self.execute(
+            'SELECT customer_id FROM customers WHERE gateway_id = ? AND status = ?',
+            (gateway_id, 'active')
+        )
+        
+        moved = 0
+        failed = 0
+        
+        for c in customers:
+            new_gw = self.get_best_gateway_for_new_customer(exclude=gateway_id)
+            if new_gw:
+                self.move_customer(c['customer_id'], new_gw)
+                moved += 1
+            else:
+                failed += 1
+        
+        # Mark gateway as offline
+        self.execute(
+            'UPDATE gateways SET status = ? WHERE gateway_id = ?',
+            ('offline', gateway_id)
+        )
+        
+        logger.info(f"Gateway {gateway_id} offline: moved {moved}, failed {failed}")
+        return {'moved': moved, 'failed': failed}
+    
+    def auto_balance_customers(self) -> dict:
+        """
+        Auto-balance customers across gateways.
+        Moves customers from overloaded gateways to underloaded ones.
+        """
+        gateways = self.get_all_gateways()
+        if len(gateways) < 2:
+            return {'moved': 0, 'message': 'Need at least 2 gateways to balance'}
+        
+        # Calculate load for each gateway
+        gateway_loads = []
+        for g in gateways:
+            count = self.get_gateway_customer_count(g['gateway_id'])
+            max_c = g['max_customers']
+            gateway_loads.append({
+                'gateway_id': g['gateway_id'],
+                'count': count,
+                'max': max_c,
+                'available': max_c - count,
+                'load_pct': (count / max_c * 100) if max_c > 0 else 100
+            })
+        
+        # Sort by load percentage
+        gateway_loads.sort(key=lambda x: x['load_pct'], reverse=True)
+        
+        moved = 0
+        moves = []
+        
+        # Find overloaded gateways (>80% or at capacity)
+        for source in gateway_loads:
+            if source['load_pct'] < 80 or source['count'] <= 1:
+                continue
+            
+            # Find underloaded gateways (<50%)
+            for target in reversed(gateway_loads):
+                if target['gateway_id'] == source['gateway_id']:
+                    continue
+                if target['load_pct'] >= 60 or target['available'] <= 0:
+                    continue
+                
+                # Get customers on source gateway
+                customers = self.execute(
+                    'SELECT customer_id FROM customers WHERE gateway_id = ? AND status = ? LIMIT 1',
+                    (source['gateway_id'], 'active')
+                )
+                
+                if customers:
+                    customer_id = customers[0]['customer_id']
+                    if self.move_customer(customer_id, target['gateway_id']):
+                        moved += 1
+                        moves.append({
+                            'customer': customer_id,
+                            'from': source['gateway_id'],
+                            'to': target['gateway_id']
+                        })
+                        source['count'] -= 1
+                        source['available'] += 1
+                        target['count'] += 1
+                        target['available'] -= 1
+                        
+                        # Recalculate loads
+                        source['load_pct'] = (source['count'] / source['max'] * 100)
+                        target['load_pct'] = (target['count'] / target['max'] * 100)
+                        
+                        # Only move one at a time per source
+                        break
+        
+        return {
+            'moved': moved,
+            'moves': moves,
+            'message': f'Moved {moved} customer(s) to balance load'
+        }
+    
+    def get_best_gateway_for_new_customer(self, exclude: str = None) -> Optional[str]:
+        """
+        Get the best gateway for a new customer.
+        Returns gateway with most available capacity and best load distribution.
+        """
+        gateways = self.get_all_gateways()
+        
+        best_gateway = None
+        best_score = -1
+        
+        for g in gateways:
+            # Skip excluded gateway
+            if g['gateway_id'] == exclude:
+                continue
+            
+            # Skip offline gateways
+            if g.get('status') == 'offline':
+                continue
+                
+            count = self.get_gateway_customer_count(g['gateway_id'])
+            max_c = g['max_customers']
+            available = max_c - count
+            
+            if available <= 0:
+                continue
+            
+            # Score based on available slots and load percentage
+            # Prefer gateways with more room
+            score = available * 10 + (100 - (count / max_c * 100))
+            
+            if score > best_score:
+                best_score = score
+                best_gateway = g['gateway_id']
+        
+        return best_gateway
 
 
 # =============================================================================
@@ -518,7 +703,10 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         <div id="section-gateways" class="section" style="display:none">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
                 <h2 style="border:none; margin:0; padding:0;">Gateways</h2>
-                <button class="btn" onclick="showAddGateway()">+ Add Gateway</button>
+                <div>
+                    <button class="btn secondary" onclick="autoBalance()">⚖️ Auto-Balance</button>
+                    <button class="btn" onclick="showAddGateway()">+ Add Gateway</button>
+                </div>
             </div>
             <table id="gateways-table">
                 <thead>
@@ -760,7 +948,10 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                     <td>${formatBytes((g.total_bytes_up || 0) + (g.total_bytes_down || 0))}</td>
                     <td>${getStatus(g.last_seen)}</td>
                     <td>${formatTime(g.last_seen)}</td>
-                    <td><button class="btn secondary" onclick="editGateway('${g.gateway_id}')">Edit</button></td>
+                    <td>
+                        <button class="btn secondary" onclick="setGatewayLimit('${g.gateway_id}')">Limit</button>
+                        <button class="btn secondary" onclick="editGateway('${g.gateway_id}')">Edit</button>
+                    </td>
                 </tr>
             `).join('');
         }
@@ -775,7 +966,10 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                     <td><code>${c.tunnel_ip || '-'}</code></td>
                     <td>${formatBytes((c.bytes_up || 0) + (c.bytes_down || 0))}</td>
                     <td>${getStatus(c.last_seen)}</td>
-                    <td><button class="btn secondary" onclick="editCustomer('${c.customer_id}')">Edit</button></td>
+                    <td>
+                        <button class="btn secondary" onclick="moveCustomer('${c.customer_id}', '${c.gateway_id || ''}')">Move</button>
+                        <button class="btn secondary" onclick="editCustomer('${c.customer_id}')">Edit</button>
+                    </td>
                 </tr>
             `).join('');
         }
@@ -832,6 +1026,67 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         async function markPaid(id) {
             await api('billing/' + id + '/paid', 'POST');
             refreshData();
+        }
+        
+        async function moveCustomer(customerId, currentGateway) {
+            // Get available gateways
+            const gateways = await api('gateways');
+            const available = gateways.filter(g => 
+                g.gateway_id !== currentGateway && 
+                (g.customer_count || 0) < g.max_customers
+            );
+            
+            if (available.length === 0) {
+                alert('No other gateways with available capacity');
+                return;
+            }
+            
+            const options = available.map(g => 
+                `${g.gateway_id} (${g.customer_count || 0}/${g.max_customers} customers)`
+            ).join('\\n');
+            
+            const choice = prompt(
+                `Move customer ${customerId} to which gateway?\\n\\nAvailable:\\n${options}\\n\\nEnter gateway ID:`
+            );
+            
+            if (choice && available.some(g => g.gateway_id === choice)) {
+                const result = await api('customers/move', 'POST', {
+                    customer_id: customerId,
+                    gateway_id: choice
+                });
+                
+                if (result.success) {
+                    alert('Customer moved successfully');
+                    refreshData();
+                } else {
+                    alert('Failed to move: ' + (result.error || 'Unknown error'));
+                }
+            }
+        }
+        
+        async function autoBalance() {
+            if (!confirm('Auto-balance will move customers from overloaded gateways to underloaded ones. Continue?')) {
+                return;
+            }
+            
+            const result = await api('gateways/balance', 'POST');
+            alert(result.message || 'Balance complete');
+            refreshData();
+        }
+        
+        async function setGatewayLimit(gatewayId) {
+            const newLimit = prompt('Set customer limit (1-20):', '9');
+            if (newLimit && !isNaN(newLimit)) {
+                const result = await api('gateways/set-limit', 'POST', {
+                    gateway_id: gatewayId,
+                    max_customers: parseInt(newLimit)
+                });
+                if (result.success) {
+                    refreshData();
+                } else {
+                    alert('Failed: ' + (result.error || 'Unknown error'));
+                }
+            }
         }
         
         // Initial load and auto-refresh
@@ -983,6 +1238,52 @@ class DashboardHandler(BaseHTTPRequestHandler):
             invoice_id = int(path.split('/')[-2])
             self.db.mark_invoice_paid(invoice_id)
             self.send_json({'success': True})
+            return
+        
+        # Move customer to different gateway
+        if path == '/api/customers/move':
+            customer_id = data.get('customer_id')
+            new_gateway_id = data.get('gateway_id')
+            
+            if not customer_id or not new_gateway_id:
+                self.send_json({'success': False, 'error': 'Missing customer_id or gateway_id'}, 400)
+                return
+            
+            # Check gateway has capacity
+            gateway = self.db.get_gateway(new_gateway_id)
+            if not gateway:
+                self.send_json({'success': False, 'error': 'Gateway not found'}, 404)
+                return
+            
+            current_count = self.db.get_gateway_customer_count(new_gateway_id)
+            max_customers = gateway.get('max_customers', 9)
+            
+            if current_count >= max_customers:
+                self.send_json({'success': False, 'error': 'Gateway at capacity'}, 400)
+                return
+            
+            # Move customer
+            success = self.db.move_customer(customer_id, new_gateway_id)
+            self.send_json({'success': success})
+            return
+        
+        # Auto-balance customers across gateways
+        if path == '/api/gateways/balance':
+            result = self.db.auto_balance_customers()
+            self.send_json(result)
+            return
+        
+        # Update gateway max_customers
+        if path == '/api/gateways/set-limit':
+            gateway_id = data.get('gateway_id')
+            max_customers = int(data.get('max_customers', 9))
+            
+            if max_customers < 1 or max_customers > 20:
+                self.send_json({'success': False, 'error': 'Limit must be 1-20'}, 400)
+                return
+            
+            success = self.db.update_gateway_limit(gateway_id, max_customers)
+            self.send_json({'success': success})
             return
         
         self.send_response(404)
