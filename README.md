@@ -1,90 +1,198 @@
 # Alkaline Network
 
-**Open-source encrypted mesh internet for rural communities using Wi-Fi HaLow**
+**The World's First Wi-Fi HaLow ISP — Open-source encrypted mesh internet for rural communities**
 
-Build your own community mesh network to bring affordable internet to underserved areas. Uses long-range 900MHz Wi-Fi HaLow technology that penetrates walls and trees - just put the box in a window.
+Wi-Fi HaLow (802.11ah) was standardized by IEEE in 2017, but consumer hardware only started shipping in 2022-2023. While everyone else is using it for IoT sensors and smart city infrastructure, we're doing something nobody else has done: **building a full ISP on top of it.**
+
+This is the complete software stack to deploy a community mesh network that brings affordable internet to underserved rural areas. Uses long-range 900MHz radio that penetrates walls and trees — customers just put a box in their window. No dish. No roof mount. No frozen antennas.
+
+---
+
+## 🚀 Quick Start — Just Use `start.bat`
+
+**For Windows users, this is all you need:**
+
+```
+Double-click start.bat
+```
+
+That's it. The GUI handles everything:
+- Flash devices
+- Manage customers
+- View billing
+- Configure network settings
+
+**For testing the full system:**
+
+```
+Double-click start_tests.bat
+```
+
+This runs the complete test suite to verify everything works before deployment.
+
+---
 
 ## How It Works
 
+### The Network Architecture
+
 ```
-[Internet] → [GATEWAY] ←--900MHz HaLow--→ [PINGER] ←--→ [PINGER] ←--→ [PINGER]
-  Starlink     (Shares)     ~500m/hop       (Home 1)      (Home 2)      (Home 3)
-                  ↓                            ↓             ↓             ↓
-             2.4GHz WiFi                  2.4GHz WiFi   2.4GHz WiFi   2.4GHz WiFi
+                                    YOUR MANAGEMENT PC
+                                    ┌─────────────────────────────────────┐
+                                    │  start.bat → alkaline_app.py       │
+                                    │  ├── Flash Tool (provision devices)│
+                                    │  ├── Dashboard (manage customers)  │
+                                    │  ├── Billing (Stripe integration)  │
+                                    │  └── Settings (network config)     │
+                                    └──────────────────┬──────────────────┘
+                                                       │ REST API / SSH
+                    ┌──────────────────────────────────┴──────────────────────────────────┐
+                    │                                                                      │
+                    ▼                                                                      ▼
+    ┌───────────────────────────────┐                          ┌───────────────────────────────┐
+    │      GATEWAY DEVICE           │                          │      GATEWAY DEVICE           │
+    │      (Host: John)             │                          │      (Host: Mary)             │
+    │                               │                          │                               │
+    │  Hardware: Heltec HT-H7608    │                          │  Hardware: Heltec HT-H7608    │
+    │  Software: alkaline_device.py │                          │  Software: alkaline_device.py │
+    │  Mode: --gateway              │                          │  Mode: --gateway              │
+    │                               │                          │                               │
+    │  ┌─────────────────────────┐  │                          │  ┌─────────────────────────┐  │
+    │  │ Connected Pingers:     │  │                          │  │ Connected Pingers:     │  │
+    │  │  • Pinger-A (Customer) │  │                          │  │  • Pinger-D (Customer) │  │
+    │  │  • Pinger-B (Customer) │  │                          │  │  • Pinger-E (Customer) │  │
+    │  │  • Pinger-C (Customer) │  │                          │  └─────────────────────────┘  │
+    │  └─────────────────────────┘  │                          │                               │
+    │            │                  │                          │            │                  │
+    │     Ethernet to Router        │                          │     Ethernet to Router        │
+    │            ▼                  │                          │            ▼                  │
+    │   [Host's Internet]           │                          │   [Host's Internet]           │
+    │   (Starlink/Cable/DSL)        │                          │   (Starlink/Cable/DSL)        │
+    └───────────────────────────────┘                          └───────────────────────────────┘
+                    ▲                                                          ▲
+                    │ 900 MHz HaLow                                            │ 900 MHz HaLow
+                    │ (WPA3 + NaCl encrypted)                                  │ (WPA3 + NaCl encrypted)
+                    │ ~500m through walls                                      │ ~500m through walls
+                    │ ~1-3 miles line-of-sight                                 │ ~1-3 miles line-of-sight
+                    │                                                          │
+    ┌───────────────┴───────────────┐                          ┌───────────────┴───────────────┐
+    │                               │                          │                               │
+    ▼               ▼               ▼                          ▼               ▼               │
+┌─────────┐   ┌─────────┐   ┌─────────┐                  ┌─────────┐   ┌─────────┐            │
+│PINGER-A │   │PINGER-B │   │PINGER-C │                  │PINGER-D │   │PINGER-E │            │
+│Customer │   │Customer │   │Customer │                  │Customer │   │Customer │            │
+│         │   │         │   │         │                  │         │   │         │            │
+│ Creates │   │ Creates │   │ Creates │                  │ Creates │   │ Creates │            │
+│ 2.4GHz  │   │ 2.4GHz  │   │ 2.4GHz  │                  │ 2.4GHz  │   │ 2.4GHz  │            │
+│ WiFi    │   │ WiFi    │   │ WiFi    │                  │ WiFi    │   │ WiFi    │            │
+└────┬────┘   └────┬────┘   └────┬────┘                  └────┬────┘   └────┬────┘            │
+     │             │             │                            │             │                 │
+     ▼             ▼             ▼                            ▼             ▼                 │
+  [Phone]       [Laptop]      [Smart TV]                   [Phone]       [Laptop]            │
+  [Tablet]      [Desktop]     [Console]                    [Tablet]      [Desktop]           │
 ```
 
-- **Gateway (Mesh Gate)**: Has internet, shares it. Earns $2/customer/month.
-- **Pinger (Mesh Point)**: Needs internet, connects through mesh. Pays $7.99/mo.
-- **Auto-discovery**: Pingers automatically find and connect to the best gateway.
-- **Multi-hop**: Traffic can jump up to 3 hops (~500m each through obstacles).
-- **Encrypted**: 3 layers - WPA3 on mesh, NaCl tunnel encryption, TLS on websites.
+### Data Flow — Step by Step
 
-## Hardware
+**When a customer opens YouTube:**
 
-**Heltec HT-H7608 Wi-Fi HaLow Router** - $79/unit
+1. **Customer's phone** connects to Pinger's 2.4GHz WiFi (standard WPA2)
+2. **Pinger** captures the traffic, encrypts it with NaCl (X25519 + XSalsa20-Poly1305)
+3. **Pinger** sends encrypted packet over 900MHz HaLow to Gateway (WPA3-SAE encrypted at radio level)
+4. **Gateway** receives packet, decrypts NaCl layer, forwards to internet via host's router
+5. **Response** comes back, Gateway encrypts with NaCl, sends back over HaLow
+6. **Pinger** decrypts, forwards to customer's phone
+7. **Customer watches video** — total latency: 20-50ms direct, 50-100ms through mesh relays
 
-- Wi-Fi HaLow (802.11ah) @ 902-928 MHz
-- ~500m range through walls/trees (window placement)
-- ~1-3 miles line-of-sight
-- Built-in 802.11s mesh
-- 2.4GHz WiFi for your devices
-- OpenWrt-based
+**What the Gateway host sees:** Encrypted blobs. They cannot decrypt customer traffic.
+
+**What we see:** Nothing. Traffic doesn't touch our servers. Billing and management only.
+
+---
+
+## The Technology: Wi-Fi HaLow (802.11ah)
+
+### Why HaLow?
+
+| Spec | HaLow (802.11ah) | Regular WiFi (802.11ac/ax) |
+|------|------------------|---------------------------|
+| Frequency | **900 MHz** | 2.4 / 5 / 6 GHz |
+| Range (outdoor) | **1-3 miles** | 300 feet |
+| Through trees | **Excellent** | Poor |
+| Through walls | **Excellent** | Degrades fast |
+| Speed | 2-32 Mbps | 100-1000+ Mbps |
+| Power consumption | **Very low** | Higher |
+| License required | **No (ISM band)** | No |
+
+**The tradeoff:** Lower speed for massively better range and penetration. For rural internet where the alternative is nothing, this is the right tradeoff.
+
+### The Hardware
+
+**Heltec HT-H7608 Wi-Fi HaLow Router** — $79/unit
+
+- **Chip:** Morse Micro MM8108 (purpose-built for HaLow)
+- **Frequency:** 902-928 MHz (US ISM band, no license needed)
+- **Max TX Power:** 30 dBm (1 Watt)
+- **Mesh:** Built-in 802.11s mesh support
+- **Customer WiFi:** 2.4GHz 802.11n for local devices
+- **OS:** OpenWrt (fully customizable)
+- **Ports:** Ethernet, USB, GPIO
 
 **Buy here:** [heltec.org/project/ht-h7608](https://heltec.org/project/ht-h7608/)
 
-## Quick Start
+### About the Technology Timeline
 
-### 1. Set Up Your Server
+- **2017:** IEEE 802.11ah (HaLow) standard finalized
+- **2020-2021:** First silicon (Morse Micro, Newracom)
+- **2022-2023:** Consumer hardware starts shipping
+- **2024-2025:** Rapid adoption for IoT, smart cities, industrial
+- **NOW:** We're using it for something nobody else has — affordable rural ISP
 
-Run on your VPS or home server (needs static IP):
+By joining now, you're part of the first wave. As adoption grows and chips improve, speeds will increase. The infrastructure you build today will only get better.
 
-```bash
-pip install pynacl
-python alkaline_complete.py --server --port 51820
+---
+
+## Security — Three Layers of Encryption
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ Layer 3: TLS/HTTPS (Website Layer)                                              │
+│ ┌─────────────────────────────────────────────────────────────────────────────┐ │
+│ │ Layer 2: NaCl Tunnel (X25519 + XSalsa20-Poly1305)                          │ │
+│ │ ┌─────────────────────────────────────────────────────────────────────────┐ │ │
+│ │ │ Layer 1: WPA3-SAE (Radio Link)                                          │ │ │
+│ │ │                                                                         │ │ │
+│ │ │                    [Your actual data is here]                           │ │ │
+│ │ │                                                                         │ │ │
+│ │ └─────────────────────────────────────────────────────────────────────────┘ │ │
+│ └─────────────────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Copy the public key it prints - you'll need it.
+### Layer 1: WPA3-SAE (Radio Level)
+- Built into the HaLow hardware
+- Automatic, no configuration needed
+- Protects the radio link between devices
 
-### 2. Install Requirements
+### Layer 2: NaCl/libsodium (Our Tunnel)
+- **X25519:** Elliptic curve key exchange (same as Signal, WhatsApp)
+- **XSalsa20:** Stream cipher for encryption
+- **Poly1305:** Authentication to detect tampering
+- Pinger encrypts → Gateway decrypts → Gateway cannot read what's inside if it's HTTPS
 
-```bash
-pip install requests paramiko pynacl
-```
+### Layer 3: TLS/HTTPS (Website Level)
+- Customer's browser encrypts to the destination website
+- We can't see inside this layer
+- Gateway host can't see inside this layer
+- Nobody can see inside this layer except the customer and the website
 
-### 3. Flash Devices
+**Result:** Gateway hosts literally cannot snoop on customer traffic. They see encrypted blobs in, encrypted blobs out.
 
-```bash
-python flash_tool.py
-```
-
-Enter your server IP and public key, then:
-1. Plug in Heltec via Ethernet
-2. Click **GATEWAY** or **PINGER**
-3. Unplug and deploy
-
-### 4. Run Dashboard
-
-```bash
-python alkaline_dashboard.py --port 8080
-```
-
-Open http://localhost:8080 to manage customers and billing.
-
-## What's Included
-
-| File | What It Does |
-|------|--------------|
-| `alkaline_complete.py` | Encrypted tunnel server/client (TUN + NaCl + compression) |
-| `alkaline_mesh.py` | Auto-discovery, auto-connect, failover |
-| `alkaline_dashboard.py` | Web dashboard for customer/billing management |
-| `alkaline_control.py` | GUI control panel (run via `start.bat`) |
-| `adaptive_bandwidth.py` | Auto-adjusts bandwidth based on signal strength |
-| `flash_tool.py` | GUI to provision and deploy devices |
-| `scripts/alkaline_boot.sh` | Auto-starts everything on device boot |
+---
 
 ## Adaptive Bandwidth
 
-The network automatically adjusts bandwidth (1/2/4/8 MHz) based on signal strength:
+The network automatically adjusts based on signal strength:
 
 | Bandwidth | Speed | Range | RSSI Threshold |
 |-----------|-------|-------|----------------|
@@ -97,72 +205,184 @@ The network automatically adjusts bandwidth (1/2/4/8 MHz) based on signal streng
 - Monitors signal strength every 5 seconds
 - **Downgrade fast** (1 min): If signal drops, quickly reduce bandwidth to maintain connection
 - **Upgrade slow** (5 min): Only increase bandwidth after sustained good signal
-- **Hysteresis**: Requires 5dB margin above threshold to upgrade (prevents oscillation)
+- **Hysteresis:** Requires 5dB margin above threshold to upgrade (prevents oscillation)
 
-**GUI Control:** The Bandwidth tab in the Control Panel (`start.bat`) lets you:
-- View current bandwidth and signal strength
-- Manually set bandwidth
-- Simulate different signal conditions for testing
-
-```bash
-# CLI usage
-python adaptive_bandwidth.py --status      # Show current status
-python adaptive_bandwidth.py --set 4       # Set to 4 MHz
-python adaptive_bandwidth.py --monitor     # Run auto-adjustment
-```
-
-## Security
-
-**Three layers of encryption:**
-
-1. **WPA3-SAE** - Mesh backbone (automatic, hardware-level)
-2. **NaCl (X25519 + XSalsa20-Poly1305)** - Tunnel encryption (same as Signal)
-3. **TLS/HTTPS** - Website encryption (passthrough)
-
-Gateway operators cannot see customer traffic - they only see encrypted blobs.
+---
 
 ## Expected Performance
 
-| Hops | Speed | Good For |
-|------|-------|----------|
-| 1 hop | 8-15 Mbps | HD streaming, video calls, gaming |
-| 2 hops | 4-7 Mbps | SD streaming, video calls |
-| 3 hops | 2-4 Mbps | Browsing, email, light video |
+| Hops | Speed | Latency | Good For |
+|------|-------|---------|----------|
+| 1 hop | 8-15 Mbps | 20-50ms | HD streaming, video calls, gaming |
+| 2 hops | 4-7 Mbps | 50-80ms | SD streaming, video calls |
+| 3 hops | 2-4 Mbps | 80-100ms | Browsing, email, light video |
 
-**With compression:** Web browsing feels like 20-30 Mbps (70-90% compression on text/HTML).
+### What 2-5 Mbps Actually Handles
+
+| Activity | Bandwidth Needed | Works? |
+|----------|------------------|--------|
+| Online gaming (Fortnite, Minecraft, CoD) | 100-500 Kbps | ✅ Perfect |
+| Zoom / Google Meet / Discord | 1.5 Mbps | ✅ Perfect |
+| YouTube 720p | 2.5 Mbps | ✅ Works great |
+| Netflix HD (720p) | 3 Mbps | ✅ Usually fine |
+| YouTube 1080p | 5 Mbps | ⚠️ Works on good signal |
+| 4K streaming | 25 Mbps | ❌ Not enough |
+| Large downloads | Any speed | ⏳ Just takes longer |
+
+**We're not competing with fiber.** We're bringing working internet to places that have none, at a price people can actually afford.
+
+---
+
+## File Structure
+
+```
+AlkalineNetwork/
+│
+├── start.bat                 # ⭐ WINDOWS USERS: DOUBLE-CLICK THIS
+├── start_tests.bat           # ⭐ Run full test suite before deployment
+│
+├── alkaline_app.py           # Main GUI application (start.bat launches this)
+│   ├── Flash Tab             # Provision gateway and pinger devices
+│   ├── Dashboard Tab         # View connected devices, customers
+│   ├── Billing Tab           # Stripe integration, payouts
+│   └── Settings Tab          # Network configuration
+│
+├── alkaline_device.py        # Runs ON the Heltec devices
+│   ├── GatewayDevice class   # Gateway mode: shares internet
+│   ├── PingerDevice class    # Pinger mode: connects to gateway
+│   ├── DeviceEncryption      # NaCl encryption
+│   └── AlkalineCompression   # zlib compression for packet headers
+│
+├── alkaline_dashboard.py     # Web dashboard (alternative to GUI)
+├── alkaline_billing.py       # Stripe payment processing
+├── adaptive_bandwidth.py     # Signal-based bandwidth adjustment
+├── flash_tool.py             # Standalone device flashing tool
+├── provisioning.py           # Device setup automation
+├── test_full_system.py       # Complete test suite
+│
+├── network_config.json       # Network configuration (auto-generated)
+├── requirements.txt          # Python dependencies
+│
+├── scripts/
+│   ├── alkaline_boot.sh      # Auto-start on device boot (Linux/OpenWrt)
+│   ├── setup_gateway.sh      # Gateway device setup script
+│   └── setup_customer.sh     # Customer device setup script
+│
+└── docs/
+    ├── ARCHITECTURE.md       # Technical architecture details
+    ├── HOW_IT_ALL_WORKS.md   # Complete system walkthrough
+    ├── HOW_IT_WORKS.md       # Simplified explanation
+    ├── HARDWARE.md           # Hardware specifications
+    ├── ONE-CLICK-FLOW.md     # User experience flow
+    ├── PAYMENT_SETUP.md      # Stripe configuration guide
+    ├── CODE_AUDIT.md         # Security audit notes
+    └── CONTRIBUTING.md       # Contribution guidelines
+```
+
+---
+
+## Getting Started
+
+### Step 1: Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+Or manually:
+```bash
+pip install requests paramiko pynacl
+```
+
+### Step 2: Run the Application
+
+**Windows:**
+```
+Double-click start.bat
+```
+
+**Linux/Mac:**
+```bash
+python alkaline_app.py
+```
+
+### Step 3: Configure Your Network
+
+1. Go to the **Settings** tab
+2. Set your mesh passphrase (32+ characters recommended)
+3. Set your customer WiFi password
+4. Save settings
+
+### Step 4: Flash Your First Gateway
+
+1. Go to the **Flash Devices** tab
+2. Connect a Heltec HT-H7608 via Ethernet
+3. Click **GATEWAY**
+4. Wait for flash to complete
+5. Unplug and deploy at host location
+
+### Step 5: Flash Customer Pingers
+
+1. Same process, but click **PINGER**
+2. The pinger will auto-discover the gateway
+3. Deploy at customer location
+
+### Step 6: Test Everything
+
+```
+Double-click start_tests.bat
+```
+
+This runs `test_full_system.py` which verifies:
+- Device communication
+- Encryption/decryption
+- Billing integration
+- Dashboard functionality
+
+---
 
 ## Pricing Model
 
 | Role | Pays | Earns |
 |------|------|-------|
-| Customer (Pinger) | $7.99/mo + $100 deposit | - |
-| Customer (no deposit) | $14.99/mo | - |
-| Gateway Operator | $0 | $2/customer/month |
+| Customer (with deposit) | $7.99/mo + $100 refundable deposit | — |
+| Customer (no deposit) | $14.99/mo | — |
+| Gateway Host | $0 | $2/customer/month |
 
-## Project Structure
+**Gateway hosts** provide the internet and earn passive income. Each gateway supports up to 9 customers = $18/month.
 
-```
-AlkalineNetwork/
-├── alkaline_complete.py   # Tunnel + encryption + compression
-├── alkaline_mesh.py       # Auto-discovery + failover
-├── alkaline_dashboard.py  # Web dashboard
-├── alkaline_control.py    # GUI control panel
-├── adaptive_bandwidth.py  # Auto-adjust bandwidth based on signal
-├── flash_tool.py          # Device provisioning GUI
-├── start.bat              # Windows launcher for control panel
-├── scripts/
-│   └── alkaline_boot.sh   # Auto-start on boot (Linux/OpenWrt)
-├── config_template.json   # Config template
-└── docs/                  # Documentation
-```
+**Customers** get affordable internet at 1/15th the price of Starlink.
+
+---
 
 ## Contributing
 
-Pull requests welcome. The code is straightforward Python - no complex dependencies.
+Pull requests welcome. The code is straightforward Python with minimal dependencies.
+
+**Before submitting:**
+1. Run `start_tests.bat` to verify nothing breaks
+2. Test on actual hardware if possible
+3. Update documentation if needed
+
+---
 
 ## License
 
-MIT License - Use it however you want.
+MIT License — Use it however you want. Build your own ISP. Fork it. Modify it. Sell it. We don't care. Just bring internet to people who need it.
+
+---
+
+## The Mission
+
+Big telecom looked at rural America and said "not profitable."
+
+Starlink said "here's internet for $120/month + $499 equipment."
+
+We said "what if neighbors just shared?"
+
+**Alkaline Network** is proof that community-owned infrastructure works. One person with Starlink can provide internet to 9 neighbors at $8/month each. Everyone wins.
+
+This is the future of rural connectivity. And it's open source.
 
 ---
 
