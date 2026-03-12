@@ -77,8 +77,39 @@ Open http://localhost:8080 to manage customers and billing.
 | `alkaline_complete.py` | Encrypted tunnel server/client (TUN + NaCl + compression) |
 | `alkaline_mesh.py` | Auto-discovery, auto-connect, failover |
 | `alkaline_dashboard.py` | Web dashboard for customer/billing management |
+| `alkaline_control.py` | GUI control panel (run via `start.bat`) |
+| `adaptive_bandwidth.py` | Auto-adjusts bandwidth based on signal strength |
 | `flash_tool.py` | GUI to provision and deploy devices |
 | `scripts/alkaline_boot.sh` | Auto-starts everything on device boot |
+
+## Adaptive Bandwidth
+
+The network automatically adjusts bandwidth (1/2/4/8 MHz) based on signal strength:
+
+| Bandwidth | Speed | Range | RSSI Threshold |
+|-----------|-------|-------|----------------|
+| 8 MHz | 15-32 Mbps | <300m | -55 dBm or better |
+| 4 MHz | 8-15 Mbps | 300-600m | -65 dBm or better |
+| 2 MHz | 2-6 Mbps | 600-900m | -75 dBm or better |
+| 1 MHz | 150Kbps-1Mbps | 900m-1km+ | -85 dBm or better |
+
+**How it works:**
+- Monitors signal strength every 5 seconds
+- **Downgrade fast** (1 min): If signal drops, quickly reduce bandwidth to maintain connection
+- **Upgrade slow** (5 min): Only increase bandwidth after sustained good signal
+- **Hysteresis**: Requires 5dB margin above threshold to upgrade (prevents oscillation)
+
+**GUI Control:** The Bandwidth tab in the Control Panel (`start.bat`) lets you:
+- View current bandwidth and signal strength
+- Manually set bandwidth
+- Simulate different signal conditions for testing
+
+```bash
+# CLI usage
+python adaptive_bandwidth.py --status      # Show current status
+python adaptive_bandwidth.py --set 4       # Set to 4 MHz
+python adaptive_bandwidth.py --monitor     # Run auto-adjustment
+```
 
 ## Security
 
@@ -115,9 +146,12 @@ AlkalineNetwork/
 ├── alkaline_complete.py   # Tunnel + encryption + compression
 ├── alkaline_mesh.py       # Auto-discovery + failover
 ├── alkaline_dashboard.py  # Web dashboard
+├── alkaline_control.py    # GUI control panel
+├── adaptive_bandwidth.py  # Auto-adjust bandwidth based on signal
 ├── flash_tool.py          # Device provisioning GUI
+├── start.bat              # Windows launcher for control panel
 ├── scripts/
-│   └── alkaline_boot.sh   # Auto-start on boot
+│   └── alkaline_boot.sh   # Auto-start on boot (Linux/OpenWrt)
 ├── config_template.json   # Config template
 └── docs/                  # Documentation
 ```

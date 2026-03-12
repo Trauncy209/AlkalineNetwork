@@ -130,7 +130,7 @@ Open an issue with:
 
 **DO NOT** open public issues for security vulnerabilities.
 
-Email: security@alkalinetech.net
+Email: security@example.com
 
 We'll respond within 48 hours.
 

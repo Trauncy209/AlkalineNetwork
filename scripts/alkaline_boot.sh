@@ -1,22 +1,19 @@
 #!/bin/sh
 #
-# Alkaline Network - Auto-Start Script
-# =====================================
+# Alkaline Network - Auto-Start Script v2.0
+# ==========================================
 #
 # This script runs on boot on both Gateway and Pinger devices.
-# It automatically:
-#   1. Detects if this is a Gateway or Pinger
-#   2. Starts the mesh discovery service
-#   3. Connects to the network
-#   4. Starts the encrypted tunnel
+# 
+# GATEWAY: Shares internet with pingers, enforces allowed device list
+# PINGER: Connects to gateway, provides WiFi to customer
+#
+# No central server needed - devices talk directly to each other.
 #
 # Installation (run once):
 #   chmod +x /opt/alkaline/alkaline_boot.sh
 #   ln -s /opt/alkaline/alkaline_boot.sh /etc/init.d/alkaline
 #   /etc/init.d/alkaline enable
-#
-# Or add to /etc/rc.local:
-#   /opt/alkaline/alkaline_boot.sh start &
 #
 
 ALKALINE_DIR="/opt/alkaline"
@@ -52,38 +49,32 @@ check_python() {
 # Read config
 read_config() {
     if [ -f "$CONFIG_FILE" ]; then
-        # Parse JSON config (basic parsing for shell)
         MODE=$(grep -o '"mode"[[:space:]]*:[[:space:]]*"[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
-        SERVER_IP=$(grep -o '"server_ip"[[:space:]]*:[[:space:]]*"[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
-        SERVER_PORT=$(grep -o '"server_port"[[:space:]]*:[[:space:]]*[0-9]*' "$CONFIG_FILE" | grep -o '[0-9]*$')
-        SERVER_PUBKEY=$(grep -o '"server_pubkey"[[:space:]]*:[[:space:]]*"[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
+        DEVICE_ID=$(grep -o '"device_id"[[:space:]]*:[[:space:]]*"[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
         MAX_CUSTOMERS=$(grep -o '"max_customers"[[:space:]]*:[[:space:]]*[0-9]*' "$CONFIG_FILE" | grep -o '[0-9]*$')
         
-        log "Config loaded: mode=$MODE"
+        log "Config loaded: mode=$MODE, device=$DEVICE_ID"
     else
-        log "No config file found, using defaults"
-        MODE="pinger"
-        SERVER_IP=""
-        SERVER_PORT="51820"
-        SERVER_PUBKEY=""
+        log "No config file found, auto-detecting mode"
+        MODE=""
+        DEVICE_ID=""
         MAX_CUSTOMERS="9"
     fi
 }
 
 # Detect mode from hardware/network
 detect_mode() {
-    # If we have an ethernet connection with internet, we're likely a gateway
-    if ip link show eth0 | grep -q "state UP"; then
-        # Check if we can reach the internet
+    # If we have ethernet with internet, we're a gateway
+    if ip link show eth0 2>/dev/null | grep -q "state UP"; then
         if ping -c 1 -W 2 8.8.8.8 > /dev/null 2>&1; then
-            log "Detected: Gateway (has internet via ethernet)"
+            log "Detected: GATEWAY (has internet via ethernet)"
             MODE="gateway"
             return
         fi
     fi
     
     # Otherwise we're a pinger
-    log "Detected: Pinger"
+    log "Detected: PINGER"
     MODE="pinger"
 }
 
@@ -105,35 +96,33 @@ wait_for_network() {
 
 # Start Alkaline services
 start_services() {
-    log "Starting Alkaline services in $MODE mode..."
+    log "Starting Alkaline in $MODE mode..."
     
     cd "$ALKALINE_DIR"
     
+    # Start the device software
     if [ "$MODE" = "gateway" ]; then
-        # Start mesh manager as gateway
-        $PYTHON alkaline_mesh.py --gateway \
+        $PYTHON alkaline_device.py --gateway \
+            --device-id "${DEVICE_ID:-GW-AUTO}" \
             --max-customers "${MAX_CUSTOMERS:-9}" \
-            --server-ip "$SERVER_IP" \
-            --server-port "${SERVER_PORT:-51820}" \
-            --server-pubkey "$SERVER_PUBKEY" \
-            >> /var/log/alkaline/mesh.log 2>&1 &
-        
-        MESH_PID=$!
-        echo "$MESH_PID" > "$PID_FILE"
-        log "Mesh manager started (PID: $MESH_PID)"
-        
+            >> /var/log/alkaline/device.log 2>&1 &
     else
-        # Start mesh manager as pinger (auto-connects)
-        $PYTHON alkaline_mesh.py --pinger \
-            --auto-connect \
-            --server-ip "$SERVER_IP" \
-            --server-port "${SERVER_PORT:-51820}" \
-            --server-pubkey "$SERVER_PUBKEY" \
-            >> /var/log/alkaline/mesh.log 2>&1 &
+        $PYTHON alkaline_device.py --pinger \
+            --device-id "${DEVICE_ID:-PN-AUTO}" \
+            >> /var/log/alkaline/device.log 2>&1 &
+    fi
+    
+    DEVICE_PID=$!
+    echo "$DEVICE_PID" > "$PID_FILE"
+    log "Device software started (PID: $DEVICE_PID)"
+    
+    # Start adaptive bandwidth controller
+    if [ -f "$ALKALINE_DIR/adaptive_bandwidth.py" ]; then
+        $PYTHON adaptive_bandwidth.py --monitor \
+            >> /var/log/alkaline/bandwidth.log 2>&1 &
         
-        MESH_PID=$!
-        echo "$MESH_PID" > "$PID_FILE"
-        log "Mesh manager started (PID: $MESH_PID)"
+        echo "$!" > "$PID_FILE.bandwidth"
+        log "Adaptive bandwidth started"
     fi
     
     log "Alkaline services started successfully"
@@ -145,16 +134,18 @@ stop_services() {
     
     if [ -f "$PID_FILE" ]; then
         PID=$(cat "$PID_FILE")
-        if kill -0 "$PID" 2>/dev/null; then
-            kill "$PID"
-            log "Stopped process $PID"
-        fi
+        kill "$PID" 2>/dev/null
         rm -f "$PID_FILE"
     fi
     
-    # Kill any remaining alkaline processes
-    pkill -f "alkaline_mesh.py" 2>/dev/null
-    pkill -f "alkaline_complete.py" 2>/dev/null
+    if [ -f "$PID_FILE.bandwidth" ]; then
+        PID=$(cat "$PID_FILE.bandwidth")
+        kill "$PID" 2>/dev/null
+        rm -f "$PID_FILE.bandwidth"
+    fi
+    
+    pkill -f "alkaline_device.py" 2>/dev/null
+    pkill -f "adaptive_bandwidth.py" 2>/dev/null
     
     log "Services stopped"
 }
@@ -176,14 +167,13 @@ status() {
 case "$1" in
     start)
         log "=========================================="
-        log "Alkaline Network Boot Sequence"
+        log "Alkaline Network Boot"
         log "=========================================="
         
         check_python
         wait_for_network
         read_config
         
-        # Auto-detect mode if not configured
         if [ -z "$MODE" ] || [ "$MODE" = "auto" ]; then
             detect_mode
         fi
@@ -206,18 +196,8 @@ case "$1" in
         ;;
     
     enable)
-        # Create init.d symlink
-        if [ -f /etc/init.d/alkaline ]; then
-            rm /etc/init.d/alkaline
-        fi
-        ln -s "$ALKALINE_DIR/alkaline_boot.sh" /etc/init.d/alkaline
-        
-        # Enable on OpenWrt
-        if [ -f /etc/rc.d/S99alkaline ]; then
-            rm /etc/rc.d/S99alkaline
-        fi
-        ln -s /etc/init.d/alkaline /etc/rc.d/S99alkaline
-        
+        ln -sf "$ALKALINE_DIR/alkaline_boot.sh" /etc/init.d/alkaline
+        ln -sf /etc/init.d/alkaline /etc/rc.d/S99alkaline 2>/dev/null
         log "Alkaline enabled on boot"
         ;;
     

@@ -472,11 +472,38 @@ class HeltecWebProvisioner:
             self._ubus_call(ubus_url, token, "luci", "setReboot", {"timeout": 5})
             
             self.log("✓ ubus configuration sent!")
+            
+            # Deploy software via SSH (ubus can't upload files)
+            if HAS_PARAMIKO:
+                self._deploy_software_via_ssh(mode, device_id)
+            
             return True
             
         except Exception as e:
             self.log(f"  ubus failed: {e}")
             return False
+    
+    def _deploy_software_via_ssh(self, mode: str, device_id: str):
+        """Deploy Alkaline software via SSH after web config."""
+        self.log("\nDeploying software via SSH...")
+        
+        try:
+            ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', self.base_url)
+            ip = ip_match.group(1) if ip_match else DEVICE_IP_ETH
+            
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(ip, username=DEVICE_USER, 
+                          password=getattr(self, '_ssh_password', DEVICE_PASSWORD),
+                          timeout=10, allow_agent=False, look_for_keys=False)
+            
+            self._deploy_alkaline_software(client, mode, device_id)
+            client.close()
+            
+        except Exception as e:
+            self.log(f"  SSH software deployment failed: {e}")
+            self.log("  Device configured but software not deployed")
+            self.log("  Adaptive bandwidth will not be available")
     
     def _ubus_call(self, url: str, token: str, obj: str, method: str, params: dict) -> dict:
         """Make a ubus RPC call."""
@@ -543,6 +570,10 @@ class HeltecWebProvisioner:
                 # Try to apply changes
                 apply_url = urljoin(self.base_url, "/cgi-bin/luci/admin/uci/apply")
                 self.session.post(apply_url, timeout=5)
+                
+                # Deploy software via SSH (forms can't upload files)
+                if HAS_PARAMIKO:
+                    self._deploy_software_via_ssh(mode, device_id)
                 
                 return True
             else:
@@ -651,8 +682,8 @@ class HeltecWebProvisioner:
             # Find our Python files
             script_dir = Path(__file__).parent
             files_to_upload = [
-                ('alkaline_complete.py', '/opt/alkaline/alkaline_complete.py'),
-                ('alkaline_mesh.py', '/opt/alkaline/alkaline_mesh.py'),
+                ('alkaline_device.py', '/opt/alkaline/alkaline_device.py'),
+                ('adaptive_bandwidth.py', '/opt/alkaline/adaptive_bandwidth.py'),
                 ('scripts/alkaline_boot.sh', '/opt/alkaline/alkaline_boot.sh'),
             ]
             
@@ -664,18 +695,21 @@ class HeltecWebProvisioner:
                 else:
                     self.log(f"  Warning: {local_name} not found")
             
-            # Create config file
+            # Create config file (no server needed - devices talk directly)
             config_content = json.dumps({
                 "mode": mode,
                 "device_id": device_id,
                 "mesh_id": self.network_config.config["mesh_id"],
-                "server_ip": self.network_config.config.get("server_ip", ""),
-                "server_port": self.network_config.config.get("server_port", 51820),
-                "server_pubkey": self.network_config.config.get("server_pubkey", ""),
                 "max_customers": 9,
                 "auto_connect": True,
+                "adaptive_bandwidth": {
+                    "enabled": True,
+                    "default_bandwidth": 4,
+                    "upgrade_delay": 300,
+                    "downgrade_delay": 60
+                },
                 "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "version": "1.0"
+                "version": "2.0"
             }, indent=2)
             
             # Write config via command (sftp might not have write permission to /etc)
@@ -692,6 +726,7 @@ class HeltecWebProvisioner:
                 'chmod +x /opt/alkaline/alkaline_boot.sh',
                 'chmod +x /opt/alkaline/alkaline_mesh.py',
                 'chmod +x /opt/alkaline/alkaline_complete.py',
+                'chmod +x /opt/alkaline/adaptive_bandwidth.py',
                 'ln -sf /opt/alkaline/alkaline_boot.sh /etc/init.d/alkaline 2>/dev/null || true',
                 '/opt/alkaline/alkaline_boot.sh enable 2>/dev/null || true',
             ]
@@ -701,6 +736,8 @@ class HeltecWebProvisioner:
             
             sftp.close()
             self.log("✓ Alkaline software deployed!")
+            self.log("  - Mesh networking: enabled")
+            self.log("  - Adaptive bandwidth: enabled")
             self.log("  Software will auto-start on boot")
             
         except Exception as e:
@@ -739,11 +776,26 @@ class FlashToolGUI:
     def __init__(self):
         self.config = NetworkConfig()
         self.root = tk.Tk()
-        self.root.title("Alkaline Network - Heltec Flash Tool v2")
-        self.root.geometry("800x700")
+        self.root.title("Alkaline Network - One-Click Provisioning")
+        self.root.geometry("900x800")
         self.root.configure(bg='#1a1a2e')
         
+        # Load pending orders
+        self.pending_orders = []
+        self.selected_order = None
+        self._load_pending_orders()
+        
         self.setup_ui()
+    
+    def _load_pending_orders(self):
+        """Load pending orders from provisioning system."""
+        try:
+            from provisioning import OrderManager
+            manager = OrderManager()
+            self.pending_orders = manager.get_pending_orders()
+        except Exception as e:
+            print(f"Could not load pending orders: {e}")
+            self.pending_orders = []
     
     def setup_ui(self):
         """Create the UI."""
@@ -751,86 +803,84 @@ class FlashToolGUI:
         # Title
         title = tk.Label(
             self.root,
-            text="⚡ Alkaline Network Flash Tool",
-            font=('Helvetica', 24, 'bold'),
+            text="⚡ Alkaline Network - One-Click Provisioning",
+            font=('Helvetica', 22, 'bold'),
             fg='#00ff88',
             bg='#1a1a2e'
         )
-        title.pack(pady=15)
+        title.pack(pady=10)
         
         # Subtitle
         subtitle = tk.Label(
             self.root,
-            text="Heltec HT-H7608 Wi-Fi HaLow Router | WPA3-SAE Encrypted Mesh",
+            text="Plug in device → Select order → Click button → Ship!",
             font=('Helvetica', 11),
             fg='#888888',
             bg='#1a1a2e'
         )
         subtitle.pack()
         
-        # Instructions
-        instructions = tk.Label(
+        # ===== PENDING ORDERS SECTION =====
+        orders_frame = tk.LabelFrame(
             self.root,
-            text="1. Connect Heltec to PC via Ethernet cable\n"
-                 "2. Wait for PC to get IP address (10.42.0.x)\n"
-                 "3. Click GATEWAY or PINGER button\n"
-                 "4. Wait for completion, unplug, ship!",
-            font=('Helvetica', 10),
-            fg='#aaaaaa',
+            text="📦 Pending Orders (click to select)",
+            font=('Helvetica', 11, 'bold'),
+            fg='#00ff88',
             bg='#1a1a2e',
-            justify='left'
+            padx=10,
+            pady=5
         )
-        instructions.pack(pady=10)
+        orders_frame.pack(pady=10, fill='x', padx=20)
         
-        # Server settings frame
-        server_frame = tk.Frame(self.root, bg='#1a1a2e')
-        server_frame.pack(pady=5, fill='x', padx=40)
+        if self.pending_orders:
+            self.order_listbox = tk.Listbox(
+                orders_frame,
+                font=('Courier', 10),
+                bg='#0a0a1e',
+                fg='#00ff88',
+                selectbackground='#0066cc',
+                selectforeground='white',
+                height=min(5, len(self.pending_orders)),
+                width=80
+            )
+            self.order_listbox.pack(fill='x', pady=5)
+            
+            for order in self.pending_orders:
+                order_type_icon = "🌐" if order.order_type == "gateway" else "📡"
+                self.order_listbox.insert(
+                    tk.END, 
+                    f"{order_type_icon} {order.order_id} | {order.customer_name:20} | {order.customer_email:25} | {order.plan}"
+                )
+            
+            self.order_listbox.bind('<<ListboxSelect>>', self._on_order_select)
+            
+            # Selected order details
+            self.selected_label = tk.Label(
+                orders_frame,
+                text="No order selected - click an order above or use manual mode below",
+                font=('Helvetica', 10),
+                fg='#ffaa00',
+                bg='#1a1a2e'
+            )
+            self.selected_label.pack(pady=5)
+        else:
+            tk.Label(
+                orders_frame,
+                text="No pending orders. Use manual mode below or add orders via website.",
+                font=('Helvetica', 10),
+                fg='#666666',
+                bg='#1a1a2e'
+            ).pack(pady=10)
+            self.order_listbox = None
+            self.selected_label = None
         
-        tk.Label(
-            server_frame,
-            text="Server IP:",
-            font=('Helvetica', 10),
-            fg='#aaaaaa',
-            bg='#1a1a2e'
-        ).grid(row=0, column=0, sticky='e', padx=5, pady=2)
-        
-        self.server_ip_entry = tk.Entry(
-            server_frame,
-            font=('Courier', 11),
-            bg='#2a2a4e',
-            fg='#ffffff',
-            insertbackground='#00ff88',
-            width=20
-        )
-        self.server_ip_entry.insert(0, self.config.config.get("server_ip", ""))
-        self.server_ip_entry.grid(row=0, column=1, padx=5, pady=2)
-        
-        tk.Label(
-            server_frame,
-            text="Server Public Key:",
-            font=('Helvetica', 10),
-            fg='#aaaaaa',
-            bg='#1a1a2e'
-        ).grid(row=1, column=0, sticky='e', padx=5, pady=2)
-        
-        self.server_pubkey_entry = tk.Entry(
-            server_frame,
-            font=('Courier', 9),
-            bg='#2a2a4e',
-            fg='#ffffff',
-            insertbackground='#00ff88',
-            width=50
-        )
-        self.server_pubkey_entry.insert(0, self.config.config.get("server_pubkey", ""))
-        self.server_pubkey_entry.grid(row=1, column=1, padx=5, pady=2)
-        
-        tk.Label(
-            server_frame,
-            text="(Get these by running: python alkaline_complete.py --server)",
-            font=('Helvetica', 8),
-            fg='#666666',
-            bg='#1a1a2e'
-        ).grid(row=2, column=0, columnspan=2, pady=2)
+        # Refresh button
+        tk.Button(
+            orders_frame,
+            text="🔄 Refresh Orders",
+            font=('Helvetica', 9),
+            command=self._refresh_orders
+        ).pack(pady=5)
         
         # Password frame
         pass_frame = tk.Frame(self.root, bg='#1a1a2e')
@@ -976,6 +1026,37 @@ class FlashToolGUI:
             f"Customer WiFi Password: {self.config.config['customer_wifi_password']}"
         )
     
+    def _on_order_select(self, event):
+        """Handle order selection."""
+        if not self.order_listbox:
+            return
+        
+        selection = self.order_listbox.curselection()
+        if selection:
+            idx = selection[0]
+            self.selected_order = self.pending_orders[idx]
+            
+            order_type_icon = "🌐 GATEWAY" if self.selected_order.order_type == "gateway" else "📡 PINGER"
+            self.selected_label.configure(
+                text=f"✅ Selected: {order_type_icon} for {self.selected_order.customer_name} ({self.selected_order.customer_email})",
+                fg='#00ff88'
+            )
+    
+    def _refresh_orders(self):
+        """Refresh pending orders list."""
+        self._load_pending_orders()
+        
+        if self.order_listbox:
+            self.order_listbox.delete(0, tk.END)
+            for order in self.pending_orders:
+                order_type_icon = "🌐" if order.order_type == "gateway" else "📡"
+                self.order_listbox.insert(
+                    tk.END,
+                    f"{order_type_icon} {order.order_id} | {order.customer_name:20} | {order.customer_email:25} | {order.plan}"
+                )
+        
+        self.log(f"Refreshed: {len(self.pending_orders)} pending orders")
+    
     def log(self, message: str):
         """Add message to log."""
         self.log_text.configure(state='normal')
@@ -995,6 +1076,12 @@ class FlashToolGUI:
     
     def flash_gateway(self):
         """Flash device as gateway."""
+        # If no order selected, use manual mode
+        if not self.selected_order or self.selected_order.order_type != 'gateway':
+            if self.selected_order and self.selected_order.order_type != 'gateway':
+                messagebox.showwarning("Wrong Order Type", "Selected order is for a PINGER, not gateway.\n\nClick a gateway order or deselect to use manual mode.")
+                return
+        
         self._do_flash("gateway")
     
     def flash_pinger(self):
@@ -1007,34 +1094,31 @@ class FlashToolGUI:
                 "Continue anyway?"
             ):
                 return
+        
+        # If no order selected, use manual mode  
+        if not self.selected_order or self.selected_order.order_type != 'pinger':
+            if self.selected_order and self.selected_order.order_type != 'pinger':
+                messagebox.showwarning("Wrong Order Type", "Selected order is for a GATEWAY, not pinger.\n\nClick a pinger order or deselect to use manual mode.")
+                return
+        
         self._do_flash("pinger")
     
     def _do_flash(self, mode: str):
         """Execute flash operation."""
         password = self.password_entry.get()
         
-        # Save server settings from GUI
-        self.config.config["server_ip"] = self.server_ip_entry.get().strip()
-        self.config.config["server_pubkey"] = self.server_pubkey_entry.get().strip()
-        self.config.save()
+        # Check if we have a selected order
+        order = self.selected_order if self.selected_order and self.selected_order.order_type == mode else None
         
-        # Validate server settings
-        if not self.config.config["server_ip"]:
-            messagebox.showwarning(
-                "Server IP Required",
-                "Enter your Alkaline server IP address.\n\n"
-                "This is where the encrypted tunnel connects to.\n\n"
-                "Run 'python alkaline_complete.py --server' on your server first."
-            )
-            return
-        
-        if not self.config.config["server_pubkey"]:
-            messagebox.showwarning(
-                "Server Public Key Required", 
-                "Enter the server's public key.\n\n"
-                "The server prints this when you start it with --server."
-            )
-            return
+        if order:
+            self.log(f"")
+            self.log(f"{'='*50}")
+            self.log(f"PROVISIONING FOR ORDER: {order.order_id}")
+            self.log(f"Customer: {order.customer_name}")
+            self.log(f"Email: {order.customer_email}")
+            self.log(f"Address: {order.customer_address}")
+            self.log(f"{'='*50}")
+            self.log(f"")
         
         self.set_buttons_state('disabled')
         mode_name = "Gateway (Mesh Gate)" if mode == "gateway" else "Pinger (Mesh Point)"
@@ -1044,6 +1128,9 @@ class FlashToolGUI:
         self.log_text.configure(state='normal')
         self.log_text.delete('1.0', 'end')
         self.log_text.configure(state='disabled')
+        
+        # Get selected order
+        order = self.selected_order if self.selected_order and self.selected_order.order_type == mode else None
         
         def do_flash():
             try:
@@ -1057,6 +1144,13 @@ class FlashToolGUI:
                 device_id = provisioner.configure_via_wizard(mode)
                 
                 if device_id:
+                    # If we have an order, register the device
+                    if order:
+                        self._register_device_for_order(order, device_id, mode)
+                    else:
+                        # Manual mode - still register to local database
+                        self._register_device_manual(device_id, mode)
+                    
                     provisioner.reboot()
                     self.update_info()
                     self.status.configure(
@@ -1070,6 +1164,13 @@ class FlashToolGUI:
                         f"WiFi Name: Alkaline-{device_id}\n"
                         f"WiFi Password: {self.config.config['customer_wifi_password']}\n\n"
                     )
+                    
+                    if order:
+                        msg += (
+                            f"ORDER: {order.order_id}\n"
+                            f"SHIP TO: {order.customer_name}\n"
+                            f"ADDRESS: {order.customer_address}\n\n"
+                        )
                     
                     if mode == "gateway":
                         msg += (
@@ -1085,6 +1186,16 @@ class FlashToolGUI:
                         )
                     
                     messagebox.showinfo(f"{mode.title()} Ready!", msg)
+                    
+                    # Clear selected order and refresh
+                    if order:
+                        self.selected_order = None
+                        if self.selected_label:
+                            self.selected_label.configure(
+                                text="✅ Device shipped! Select next order.",
+                                fg='#00ff88'
+                            )
+                        self._refresh_orders()
                 else:
                     self.status.configure(text="Provisioning failed - see log", fg='#ff4444')
                 
@@ -1097,6 +1208,105 @@ class FlashToolGUI:
                 self.set_buttons_state('normal')
         
         threading.Thread(target=do_flash, daemon=True).start()
+    
+    def _register_device_for_order(self, order, device_id: str, mode: str):
+        """Register device with provisioning system and update order."""
+        try:
+            from provisioning import OrderManager, DeviceProvisioner, GatewayAssigner
+            import secrets
+            import hashlib
+            
+            self.log(f"\n[REGISTER] Registering device for order {order.order_id}...")
+            
+            # Generate keys for the device (in real implementation, device generates these)
+            # For now, we generate them here and will deploy to device
+            public_key = secrets.token_hex(32)
+            private_key = secrets.token_hex(32)
+            private_key_hash = hashlib.sha256(private_key.encode()).hexdigest()
+            
+            # Provision in system
+            provisioner = DeviceProvisioner()
+            device = provisioner.provision_device(
+                order=order,
+                public_key=public_key,
+                private_key_hash=private_key_hash,
+                mac_address=""  # Could get from device
+            )
+            
+            self.log(f"[REGISTER] Device ID: {device.device_id}")
+            
+            # Update order status
+            manager = OrderManager()
+            manager.mark_provisioned(
+                order.order_id,
+                device.device_id,
+                device.public_key,
+                device.tunnel_ip
+            )
+            manager.mark_shipped(order.order_id)
+            
+            self.log(f"[REGISTER] Order {order.order_id} marked as SHIPPED")
+            self.log(f"[REGISTER] Device ready for deployment!")
+            
+        except Exception as e:
+            self.log(f"[REGISTER] Warning: Could not register device: {e}")
+            self.log(f"[REGISTER] Device still functional, manual registration needed")
+    
+    def _register_device_manual(self, device_id: str, mode: str):
+        """Register device to local database when no order is used (manual mode)."""
+        try:
+            import sqlite3
+            from pathlib import Path
+            
+            db_path = Path("alkaline.db")
+            if not db_path.exists():
+                self.log(f"[REGISTER] No database yet - device tracked locally only")
+                return
+            
+            conn = sqlite3.connect(str(db_path))
+            c = conn.cursor()
+            
+            if mode == "gateway":
+                # Add to gateways table
+                c.execute("""
+                    INSERT OR REPLACE INTO gateways (
+                        gateway_id, public_key, owner_name, owner_email,
+                        status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    device_id,
+                    "pending_key_exchange",  # Will get real key when device connects
+                    "Manual Provision",
+                    "",
+                    "provisioned",
+                    time.time()
+                ))
+                self.log(f"[REGISTER] Gateway {device_id} added to database")
+            else:
+                # Add to customers table as unassigned pinger
+                c.execute("""
+                    INSERT OR REPLACE INTO customers (
+                        customer_id, pinger_id, public_key, name, email,
+                        status, subscription_status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    f"manual_{device_id}",
+                    device_id,
+                    "pending_key_exchange",
+                    "Manual Provision",
+                    "",
+                    "provisioned",
+                    "pending_assignment",
+                    time.time()
+                ))
+                self.log(f"[REGISTER] Pinger {device_id} added to database")
+            
+            conn.commit()
+            conn.close()
+            
+        except Exception as e:
+            self.log(f"[REGISTER] Note: Local registration skipped: {e}")
+            self.log(f"[REGISTER] Device still works - will appear when it connects")
     
     def run(self):
         """Run the GUI."""

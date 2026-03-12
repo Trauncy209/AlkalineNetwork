@@ -1125,9 +1125,281 @@ class DashboardHandler(BaseHTTPRequestHandler):
     
     db = None  # Set by server
     
+    # Rate limiting - track bad requests per IP
+    bad_request_counts = {}  # {ip: count}
+    blocked_ips = set()
+    MAX_BAD_REQUESTS = 10  # Block after 10 bad requests
+    
+    # Honeypot logging
+    honeypot_log = []
+    
+    # Paths that scanners look for - we'll trap them
+    HONEYPOT_PATHS = [
+        '/wp-admin', '/wp-login.php', '/wp-login', '/wordpress',
+        '/phpmyadmin', '/pma', '/myadmin', '/mysql', '/sqladmin',
+        '/admin', '/administrator', '/admin.php', '/login.php',
+        '/.env', '/.git', '/.git/config', '/config.php', '/config.json',
+        '/backup', '/backup.sql', '/database.sql', '/dump.sql',
+        '/shell', '/shell.php', '/cmd', '/cmd.php', '/c99.php',
+        '/xmlrpc.php', '/wp-content', '/wp-includes',
+        '/api/v1', '/api/v2', '/graphql', '/swagger',
+        '/.aws/credentials', '/.ssh', '/id_rsa',
+        '/actuator', '/actuator/health', '/metrics', '/debug',
+        '/server-status', '/server-info', '/.htaccess',
+        '/cgi-bin', '/scripts', '/fckeditor', '/ckfinder',
+    ]
+    
+    # Fake WordPress login page to waste their time
+    FAKE_WP_LOGIN = '''<!DOCTYPE html>
+<html>
+<head><title>Log In &lsaquo; Alkaline &#8212; WordPress</title>
+<style>
+body{background:#f1f1f1;font-family:-apple-system,sans-serif}
+.login{width:320px;margin:100px auto;padding:20px;background:#fff;border:1px solid #ccc}
+input{width:100%;padding:10px;margin:10px 0;box-sizing:border-box}
+.button{background:#2271b1;color:#fff;border:none;cursor:pointer}
+</style></head>
+<body>
+<div class="login">
+<h1>WordPress</h1>
+<form method="POST" action="/wp-login.php">
+<label>Username<input type="text" name="log" id="user_login"></label>
+<label>Password<input type="password" name="pwd" id="user_pass"></label>
+<input type="submit" class="button" value="Log In">
+<input type="hidden" name="redirect_to" value="/wp-admin/">
+</form>
+<p><a href="/wp-login.php?action=lostpassword">Lost your password?</a></p>
+</div>
+<script>
+// Log everything they do lmao
+document.querySelectorAll('input').forEach(i => {
+    i.addEventListener('input', () => {
+        fetch('/wp-admin/log.php?k=' + btoa(JSON.stringify({
+            user: document.getElementById('user_login').value,
+            pass: document.getElementById('user_pass').value,
+            t: Date.now()
+        })));
+    });
+});
+</script>
+</body></html>'''
+
+    # Fake successful login response (keeps them engaged)
+    FAKE_WP_ADMIN = '''<!DOCTYPE html>
+<html><head><title>Dashboard &lsaquo; Alkaline &#8212; WordPress</title></head>
+<body>
+<h1>Dashboard</h1>
+<p>Welcome back, admin!</p>
+<p>Loading dashboard...</p>
+<script>
+// Make them wait forever lol
+setInterval(() => {
+    document.body.innerHTML += '<p>Loading modules...</p>';
+}, 2000);
+// Log that they "got in"
+fetch('/wp-admin/beacon.php?status=authenticated&t=' + Date.now());
+</script>
+</body></html>'''
+
+    # Fake .env file with honeypot credentials
+    FAKE_ENV = '''# Production Environment
+APP_ENV=production
+APP_DEBUG=true
+APP_KEY=base64:fakekeyfakekeyfakekeyfakekey123=
+
+DB_HOST=localhost
+DB_DATABASE=alkaline_prod
+DB_USERNAME=admin
+DB_PASSWORD=Str0ngP@ssw0rd2024!
+
+AWS_ACCESS_KEY_ID=AKIAFAKEACCESSKEY123
+AWS_SECRET_ACCESS_KEY=FakeSecretKeyThatLooksReal1234567890abc
+AWS_BUCKET=alkaline-backups
+
+STRIPE_SECRET=sk_live_fakefakefakefakefakefakefake
+STRIPE_WEBHOOK_SECRET=whsec_fakefakefakefakefake
+
+SMTP_PASSWORD=EmailP@ssw0rd123!
+'''
+
+    # Fake database dump header
+    FAKE_SQL_DUMP = '''-- MySQL dump 10.13  Distrib 8.0.32
+-- Host: localhost    Database: alkaline_prod
+-- Server version	8.0.32
+
+/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;
+
+--
+-- Table structure for table `users`
+--
+
+DROP TABLE IF EXISTS `users`;
+CREATE TABLE `users` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `username` varchar(255) NOT NULL,
+  `password` varchar(255) NOT NULL,
+  `email` varchar(255) NOT NULL,
+  PRIMARY KEY (`id`)
+);
+
+--
+-- Dumping data for table `users`
+--
+
+INSERT INTO `users` VALUES 
+(1,'admin','$2y$10$FakeHashThatLooksReal123456789','admin@alkaline.local'),
+(2,'developer','$2y$10$AnotherFakeHashHere12345678','dev@alkaline.local'),
+(3,'backup','$2y$10$YetAnotherFakeHash123456789','backup@alkaline.local');
+
+-- These credentials are honeypots. If you're reading this, we logged your IP.
+-- Have a nice day :)
+'''
+    
     def log_message(self, format, *args):
-        """Suppress default logging."""
-        pass
+        """Log with timestamp and IP."""
+        client_ip = self.client_address[0]
+        # Check for Cloudflare real IP header
+        cf_ip = self.headers.get('CF-Connecting-IP', '')
+        real_ip = cf_ip if cf_ip else client_ip
+        
+        print(f"[{time.strftime('%H:%M:%S')}] [{real_ip}] {format % args}")
+    
+    def log_error(self, format, *args):
+        """Log errors with full details."""
+        client_ip = self.client_address[0]
+        cf_ip = self.headers.get('CF-Connecting-IP', '')
+        real_ip = cf_ip if cf_ip else client_ip
+        
+        # Track bad requests
+        if real_ip not in self.bad_request_counts:
+            self.bad_request_counts[real_ip] = 0
+        self.bad_request_counts[real_ip] += 1
+        
+        # Block if too many bad requests
+        if self.bad_request_counts[real_ip] >= self.MAX_BAD_REQUESTS:
+            self.blocked_ips.add(real_ip)
+            print(f"[{time.strftime('%H:%M:%S')}] [BLOCKED] {real_ip} - too many bad requests")
+        
+        print(f"[{time.strftime('%H:%M:%S')}] [ERROR] [{real_ip}] {format % args}")
+        print(f"    Path: {getattr(self, 'path', 'unknown')}")
+        print(f"    User-Agent: {self.headers.get('User-Agent', 'none')[:80]}")
+    
+    def log_honeypot(self, event_type: str, details: dict):
+        """Log honeypot interactions."""
+        client_ip = self.client_address[0]
+        cf_ip = self.headers.get('CF-Connecting-IP', '')
+        real_ip = cf_ip if cf_ip else client_ip
+        
+        entry = {
+            "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
+            "ip": real_ip,
+            "type": event_type,
+            "path": self.path,
+            "user_agent": self.headers.get('User-Agent', ''),
+            "details": details
+        }
+        
+        self.honeypot_log.append(entry)
+        
+        # Print with fun emoji
+        print(f"[{time.strftime('%H:%M:%S')}] [🍯 HONEYPOT] [{real_ip}] {event_type}")
+        print(f"    Path: {self.path}")
+        print(f"    User-Agent: {self.headers.get('User-Agent', 'none')[:60]}")
+        if details:
+            print(f"    Details: {details}")
+        
+        # Save to file
+        try:
+            with open("honeypot_log.json", "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except:
+            pass
+    
+    def is_blocked(self) -> bool:
+        """Check if client IP is blocked."""
+        client_ip = self.client_address[0]
+        cf_ip = self.headers.get('CF-Connecting-IP', '')
+        real_ip = cf_ip if cf_ip else client_ip
+        return real_ip in self.blocked_ips
+    
+    def is_honeypot_path(self, path: str) -> bool:
+        """Check if this is a honeypot trap path."""
+        path_lower = path.lower()
+        for hp_path in self.HONEYPOT_PATHS:
+            if path_lower.startswith(hp_path.lower()):
+                return True
+        return False
+    
+    def serve_honeypot(self, path: str):
+        """Serve honeypot content based on path."""
+        path_lower = path.lower()
+        
+        # WordPress login
+        if 'wp-login' in path_lower:
+            self.log_honeypot("WP_LOGIN_PAGE", {})
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(self.FAKE_WP_LOGIN.encode())
+            return
+        
+        # WordPress admin (they "got in")
+        if 'wp-admin' in path_lower:
+            self.log_honeypot("WP_ADMIN_ACCESS", {"path": path})
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(self.FAKE_WP_ADMIN.encode())
+            return
+        
+        # .env file (juicy fake creds)
+        if '.env' in path_lower:
+            self.log_honeypot("ENV_FILE_ACCESS", {})
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            # Add delay to waste their time
+            time.sleep(2)
+            self.wfile.write(self.FAKE_ENV.encode())
+            return
+        
+        # Database dumps
+        if '.sql' in path_lower or 'dump' in path_lower or 'backup' in path_lower:
+            self.log_honeypot("DATABASE_DUMP_ACCESS", {})
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            time.sleep(3)  # Extra slow lol
+            self.wfile.write(self.FAKE_SQL_DUMP.encode())
+            return
+        
+        # Git config
+        if '.git' in path_lower:
+            self.log_honeypot("GIT_ACCESS", {})
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            fake_git = '[core]\n\trepositoryformatversion = 0\n\tbare = false\n[remote "origin"]\n\turl = git@github.com:alkaline/secret-prod.git\n'
+            self.wfile.write(fake_git.encode())
+            return
+        
+        # phpMyAdmin / database admin
+        if 'phpmyadmin' in path_lower or 'pma' in path_lower or 'mysql' in path_lower:
+            self.log_honeypot("PHPMYADMIN_SCAN", {})
+            # Return a fake login page
+            fake_pma = '<html><head><title>phpMyAdmin</title></head><body><h1>phpMyAdmin 4.9.5</h1><form method="post"><input name="pma_username" placeholder="Username"><input name="pma_password" type="password" placeholder="Password"><button>Login</button></form></body></html>'
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(fake_pma.encode())
+            return
+        
+        # Default: log the scan attempt and return fake 200
+        self.log_honeypot("SCAN_ATTEMPT", {"path": path})
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html')
+        self.end_headers()
+        self.wfile.write(b'<html><body>OK</body></html>')
     
     def send_json(self, data: dict, status: int = 200):
         """Send JSON response."""
@@ -1139,8 +1411,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
     
     def do_GET(self):
         """Handle GET requests."""
+        # Check if blocked
+        if self.is_blocked():
+            self.send_error(403, "Blocked")
+            return
+        
         parsed = urlparse(self.path)
         path = parsed.path
+        
+        # Check honeypot paths FIRST
+        if self.is_honeypot_path(path):
+            self.serve_honeypot(path)
+            return
         
         # Dashboard HTML
         if path == '/' or path == '/dashboard':
@@ -1181,6 +1463,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
             })
             return
         
+        # Honeypot logs - see who's been naughty
+        if path == '/api/honeypot' or path == '/honeypot':
+            logs = list(self.honeypot_log[-100:])  # Last 100 entries
+            
+            # Also load from file if exists
+            try:
+                with open("honeypot_log.json", "r") as f:
+                    for line in f:
+                        try:
+                            logs.append(json.loads(line.strip()))
+                        except:
+                            pass
+            except:
+                pass
+            
+            # Sort by timestamp desc
+            logs = sorted(logs, key=lambda x: x.get('timestamp', ''), reverse=True)[:100]
+            
+            # Summary stats
+            unique_ips = set(l.get('ip') for l in logs)
+            login_attempts = [l for l in logs if l.get('type') == 'LOGIN_ATTEMPT']
+            
+            self.send_json({
+                'total_traps': len(logs),
+                'unique_attackers': len(unique_ips),
+                'login_attempts': len(login_attempts),
+                'blocked_ips': list(self.blocked_ips),
+                'logs': logs
+            })
+            return
+        
         if path == '/api/gateways':
             gateways = self.db.get_all_gateways()
             for g in gateways:
@@ -1217,14 +1530,50 @@ class DashboardHandler(BaseHTTPRequestHandler):
     
     def do_POST(self):
         """Handle POST requests."""
+        # Check if blocked
+        if self.is_blocked():
+            self.send_error(403, "Blocked")
+            return
+        
         parsed = urlparse(self.path)
         path = parsed.path
         
         content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length)
+        raw_data = self.rfile.read(content_length)
+        
+        # Check honeypot paths - capture their login attempts!
+        if self.is_honeypot_path(path):
+            # Parse form data or JSON
+            try:
+                if b'=' in raw_data:
+                    # Form data
+                    from urllib.parse import parse_qs
+                    form_data = parse_qs(raw_data.decode())
+                    creds = {k: v[0] if len(v) == 1 else v for k, v in form_data.items()}
+                else:
+                    creds = json.loads(raw_data) if raw_data else {}
+            except:
+                creds = {"raw": raw_data.decode(errors='replace')[:500]}
+            
+            self.log_honeypot("LOGIN_ATTEMPT", creds)
+            
+            # If WordPress login, pretend it worked and redirect to admin
+            if 'wp-login' in path.lower():
+                self.send_response(302)
+                self.send_header('Location', '/wp-admin/')
+                self.send_header('Set-Cookie', 'wordpress_logged_in_fake=admin%7C1234567890; path=/')
+                self.end_headers()
+                return
+            
+            # Generic success response
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"success": true, "message": "Authenticated"}')
+            return
         
         try:
-            data = json.loads(body) if body else {}
+            data = json.loads(raw_data) if raw_data else {}
         except:
             data = {}
         
@@ -1303,6 +1652,62 @@ class DashboardHandler(BaseHTTPRequestHandler):
             success = self.db.update_gateway_limit(gateway_id, max_customers)
             self.send_json({'success': success})
             return
+        
+        # Stripe webhook endpoint
+        if path == '/webhook/stripe':
+            try:
+                from alkaline_billing import BillingDatabase, StripePayments
+                
+                # Get Stripe signature header
+                sig_header = self.headers.get('Stripe-Signature', '')
+                
+                billing_db = BillingDatabase()
+                payments = StripePayments(billing_db)
+                
+                success = payments.handle_webhook(raw_data, sig_header)
+                
+                if success:
+                    self.send_json({'received': True})
+                else:
+                    self.send_json({'error': 'Webhook processing failed'}, 400)
+                return
+            except ImportError:
+                self.send_json({'error': 'Billing module not available'}, 500)
+                return
+            except Exception as e:
+                logger.error(f"Webhook error: {e}")
+                self.send_json({'error': str(e)}, 500)
+                return
+        
+        # Sync customers to tunnel server
+        if path == '/api/sync':
+            try:
+                from alkaline_billing import BillingDatabase, sync_clients_json
+                billing_db = BillingDatabase()
+                count = sync_clients_json(billing_db)
+                self.send_json({'success': True, 'synced': count})
+                return
+            except ImportError:
+                self.send_json({'error': 'Billing module not available'}, 500)
+                return
+        
+        # Trigger payout to gateway
+        if path == '/api/gateways/payout':
+            gateway_id = data.get('gateway_id')
+            if not gateway_id:
+                self.send_json({'success': False, 'error': 'Missing gateway_id'}, 400)
+                return
+            
+            try:
+                from alkaline_billing import BillingDatabase, StripePayments
+                billing_db = BillingDatabase()
+                payments = StripePayments(billing_db)
+                result = payments.payout_gateway(gateway_id)
+                self.send_json({'success': bool(result), 'transfer_id': result})
+                return
+            except ImportError:
+                self.send_json({'error': 'Billing module not available'}, 500)
+                return
         
         self.send_response(404)
         self.end_headers()
